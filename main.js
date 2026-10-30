@@ -1,0 +1,307 @@
+/**
+ * Koptic Desktop (stage 1).
+ *
+ * - The Koptic window: koptic.vercel.app in its own window and tray icon.
+ * - Its own Classroom window: you sign in once with your school account, and
+ *   from then on the app reads your To-do list (every Google account signed
+ *   in there, skipping ones with no classes), opens each assignment to get
+ *   the instructions, and reads attached Google Docs. All of it goes to
+ *   Koptic with your connection token, the same one the extension uses.
+ * - Syncs when it starts, every 2 hours, and from the tray's "Sync now".
+ *
+ * Read only: it never turns in, edits or posts anything in Classroom.
+ */
+const { app, BrowserWindow, Menu, Notification, Tray, ipcMain, safeStorage, session, shell } = require("electron");
+const fs = require("node:fs");
+const path = require("node:path");
+const { READ_TODO, READ_DETAIL } = require("./classroom-scripts");
+
+const KOPTIC = "https://koptic.vercel.app";
+const SYNC_EVERY_MS = 2 * 60 * 60 * 1000;
+const MAX_ACCOUNTS = 5;
+const MAX_DETAILS = 25;
+
+if (!app.requestSingleInstanceLock()) app.quit();
+
+let mainWindow = null;
+let classroomWindow = null;
+let tray = null;
+let syncing = false;
+let lastSync = null;
+
+// ---------------- settings and the token ----------------
+
+const dataFile = (name) => path.join(app.getPath("userData"), name);
+
+function readSettings() {
+  try {
+    return JSON.parse(fs.readFileSync(dataFile("settings.json"), "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function writeSettings(patch) {
+  const next = { ...readSettings(), ...patch };
+  fs.writeFileSync(dataFile("settings.json"), JSON.stringify(next, null, 2));
+  return next;
+}
+
+function readToken() {
+  try {
+    const buf = fs.readFileSync(dataFile("token.bin"));
+    return safeStorage.isEncryptionAvailable() ? safeStorage.decryptString(buf) : buf.toString("utf8");
+  } catch {
+    return null;
+  }
+}
+
+function saveToken(token) {
+  const buf = safeStorage.isEncryptionAvailable() ? safeStorage.encryptString(token) : Buffer.from(token, "utf8");
+  fs.writeFileSync(dataFile("token.bin"), buf);
+}
+
+// ---------------- windows ----------------
+
+function showKoptic(route = "/today") {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.show();
+    mainWindow.focus();
+    if (route) mainWindow.loadURL(KOPTIC + route);
+    return;
+  }
+  mainWindow = new BrowserWindow({
+    width: 1320,
+    height: 860,
+    title: "Koptic",
+    icon: path.join(__dirname, "icon.png"),
+    autoHideMenuBar: true,
+    webPreferences: {
+      partition: "persist:koptic",
+      preload: path.join(__dirname, "preload-koptic.js"),
+      contextIsolation: true,
+      sandbox: false,
+    },
+  });
+  mainWindow.loadURL(KOPTIC + route);
+  // Links to other sites open in the normal browser, not inside the app.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (!url.startsWith(KOPTIC)) shell.openExternal(url);
+    return { action: url.startsWith(KOPTIC) ? "allow" : "deny" };
+  });
+  // Closing hides to the tray, so syncing keeps going.
+  mainWindow.on("close", (e) => {
+    if (!app.isQuitting) {
+      e.preventDefault();
+      mainWindow.hide();
+    }
+  });
+}
+
+function getClassroomWindow(show) {
+  if (!classroomWindow || classroomWindow.isDestroyed()) {
+    classroomWindow = new BrowserWindow({
+      width: 1100,
+      height: 800,
+      show: false,
+      title: "Classroom (Koptic)",
+      icon: path.join(__dirname, "icon.png"),
+      autoHideMenuBar: true,
+      webPreferences: { partition: "persist:classroom", contextIsolation: true, sandbox: true },
+    });
+    classroomWindow.on("close", (e) => {
+      if (!app.isQuitting) {
+        e.preventDefault();
+        classroomWindow.hide();
+      }
+    });
+  }
+  if (show) {
+    classroomWindow.show();
+    classroomWindow.focus();
+  }
+  return classroomWindow;
+}
+
+function signInToClassroom() {
+  const win = getClassroomWindow(true);
+  win.loadURL("https://classroom.google.com/");
+  notify("Sign in to Classroom", "Use your school account. Close this window when you see your classes.");
+}
+
+// ---------------- sync ----------------
+
+function notify(title, body) {
+  if (Notification.isSupported()) new Notification({ title, body, icon: path.join(__dirname, "icon.png") }).show();
+}
+
+async function load(win, url) {
+  await win.loadURL(url).catch(() => {});
+  await new Promise((r) => setTimeout(r, 1500));
+}
+
+async function postJson(route, body) {
+  const res = await fetch(KOPTIC + route, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Koptic said ${res.status}`);
+  return data;
+}
+
+/** Text of a Google Doc the school account can open, or "" if it can't. */
+async function docText(id, account) {
+  try {
+    const ses = session.fromPartition("persist:classroom");
+    const res = await ses.fetch(
+      `https://docs.google.com/document/d/${id}/export?format=txt&authuser=${account}`,
+    );
+    const type = res.headers.get("content-type") || "";
+    if (!res.ok || !type.startsWith("text/plain")) return "";
+    return (await res.text()).slice(0, 12000);
+  } catch {
+    return "";
+  }
+}
+
+async function syncClassroom({ deep = false, quiet = false } = {}) {
+  if (syncing) return;
+  const token = readToken();
+  if (!token) {
+    if (!quiet) {
+      notify("Connect Koptic first", "Opening Connect Classroom. Sign in to Koptic there.");
+      showKoptic("/connect/classroom");
+    }
+    return;
+  }
+  syncing = true;
+  updateTray();
+  const win = getClassroomWindow(false);
+  const settings = readSettings();
+  const order = [settings.classroomAccount ?? 0, ...Array.from({ length: MAX_ACCOUNTS }, (_, i) => i)].filter(
+    (n, i, all) => all.indexOf(n) === i,
+  );
+
+  let added = 0;
+  let filled = 0;
+  let found = false;
+  try {
+    for (const account of order) {
+      await load(win, `https://classroom.google.com/u/${account}/a/not-turned-in/all`);
+      const todo = await win.webContents.executeJavaScript(READ_TODO, true).catch(() => null);
+      if (!todo || !todo.signedIn) {
+        if (account === order[0] && !found) {
+          if (!quiet) signInToClassroom();
+          break;
+        }
+        continue;
+      }
+      if (!todo.hasClasses) continue;
+      found = true;
+      writeSettings({ classroomAccount: account });
+
+      for (const text of todo.texts.filter((t) => t.length >= 20)) {
+        const r = await postJson("/api/extension/import", { token, text });
+        added += Number(r.added) || 0;
+      }
+
+      // Instructions and attached Docs, for each assignment on the list.
+      const items = [];
+      for (const link of todo.links.slice(0, deep ? MAX_DETAILS : 10)) {
+        await load(win, link.href);
+        const detail = await win.webContents.executeJavaScript(READ_DETAIL, true).catch(() => null);
+        if (!detail) continue;
+        const docs = [];
+        for (const [id, name] of Object.entries(detail.docs || {}).slice(0, 3)) {
+          const text = await docText(id, account);
+          if (text) docs.push({ name, text });
+        }
+        items.push({ title: link.title, courseName: link.course, pageText: detail.text, docs });
+      }
+      if (items.length > 0) {
+        const r = await postJson("/api/desktop/details", { token, items });
+        filled += Number(r.filled) || 0;
+      }
+      break;
+    }
+
+    lastSync = new Date();
+    if (!found && !quiet) notify("No classes found", "Sign in to Classroom with your school account, then press Sync now.");
+    else if (added > 0 || filled > 0 || !quiet) {
+      notify(
+        "Koptic is up to date",
+        added > 0 ? `${added} new from Classroom.` : filled > 0 ? `Instructions added to ${filled}.` : "Nothing new in Classroom.",
+      );
+    }
+  } catch (err) {
+    if (!quiet) notify("Couldn't sync", String(err && err.message ? err.message : err));
+  } finally {
+    syncing = false;
+    updateTray();
+  }
+}
+
+// ---------------- tray ----------------
+
+function updateTray() {
+  if (!tray) return;
+  const startAtLogin = app.getLoginItemSettings().openAtLogin;
+  tray.setToolTip(syncing ? "Koptic: syncing…" : "Koptic");
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: "Open Koptic", click: () => showKoptic() },
+      { label: syncing ? "Syncing…" : "Sync Classroom Now", enabled: !syncing, click: () => syncClassroom({ deep: true }) },
+      { label: "Sign In to Classroom", click: signInToClassroom },
+      { type: "separator" },
+      {
+        label: lastSync ? `Last synced ${lastSync.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : "Not synced yet",
+        enabled: false,
+      },
+      {
+        label: "Start with Windows",
+        type: "checkbox",
+        checked: startAtLogin,
+        click: (item) => {
+          app.setLoginItemSettings({ openAtLogin: item.checked, args: ["--hidden"] });
+          updateTray();
+        },
+      },
+      { type: "separator" },
+      {
+        label: "Quit Koptic",
+        click: () => {
+          app.isQuitting = true;
+          app.quit();
+        },
+      },
+    ]),
+  );
+}
+
+// ---------------- start ----------------
+
+ipcMain.handle("koptic:paired", () => Boolean(readToken()));
+ipcMain.handle("koptic:pair", (_e, token) => {
+  if (typeof token !== "string" || token.length < 32 || token.length > 256 || !/^[A-Za-z0-9_-]+$/.test(token)) return false;
+  saveToken(token);
+  return true;
+});
+ipcMain.handle("koptic:sync", (_e, opts) => syncClassroom({ deep: Boolean(opts && opts.deep) }));
+
+app.on("second-instance", () => showKoptic(null));
+
+app.whenReady().then(() => {
+  if (process.platform === "win32") app.setAppUserModelId("app.koptic.desktop");
+  tray = new Tray(path.join(__dirname, "icon.png"));
+  tray.on("click", () => showKoptic(null));
+  updateTray();
+
+  if (!process.argv.includes("--hidden")) showKoptic(readToken() ? "/today" : "/connect/classroom");
+  setTimeout(() => syncClassroom({ quiet: true }), 30_000);
+  setInterval(() => syncClassroom({ quiet: true }), SYNC_EVERY_MS);
+});
+
+// Keep running in the tray when every window is closed.
+app.on("window-all-closed", () => {});
