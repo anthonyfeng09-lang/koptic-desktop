@@ -118,7 +118,9 @@ function getClassroomWindow(show) {
       title: "Classroom (Koptic)",
       icon: path.join(__dirname, "icon.png"),
       autoHideMenuBar: true,
-      webPreferences: { partition: "persist:classroom", contextIsolation: true, sandbox: true },
+      // Not throttled while hidden: Chromium slows a hidden page's timers to
+      // about once a minute, which turned a 30 second read into a stuck sync.
+      webPreferences: { partition: "persist:classroom", contextIsolation: true, sandbox: true, backgroundThrottling: false },
     });
     classroomWindow.on("close", (e) => {
       if (!app.isQuitting) {
@@ -144,6 +146,15 @@ function signInToClassroom() {
 
 function notify(title, body) {
   if (Notification.isSupported()) new Notification({ title, body, icon: path.join(__dirname, "icon.png") }).show();
+}
+
+/** Run a reader in the Classroom window, giving up after `ms` instead of
+ *  waiting forever on a page that never settles. */
+function run(win, code, ms = 45000) {
+  return Promise.race([
+    win.webContents.executeJavaScript(code, true),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("Classroom took too long")), ms)),
+  ]);
 }
 
 async function load(win, url) {
@@ -177,8 +188,11 @@ async function docText(id, account) {
   }
 }
 
+let syncStartedAt = 0;
+
 async function syncClassroom({ deep = false, quiet = false } = {}) {
-  if (syncing) return;
+  // A sync that somehow never finished must not block every later one.
+  if (syncing && Date.now() - syncStartedAt < 10 * 60 * 1000) return;
   const token = readToken();
   if (!token) {
     if (!quiet) {
@@ -188,8 +202,10 @@ async function syncClassroom({ deep = false, quiet = false } = {}) {
     return;
   }
   syncing = true;
+  syncStartedAt = Date.now();
   syncLog = [];
   logLine(`sync start deep=${deep} quiet=${quiet}`);
+  flushLog();
   updateTray();
   const win = getClassroomWindow(false);
   const settings = readSettings();
@@ -203,7 +219,7 @@ async function syncClassroom({ deep = false, quiet = false } = {}) {
   try {
     for (const account of order) {
       await load(win, `https://classroom.google.com/u/${account}/a/not-turned-in/all`);
-      const todo = await win.webContents.executeJavaScript(READ_TODO, true).catch((e) => {
+      const todo = await run(win, READ_TODO).catch((e) => {
         logLine(`account ${account}: read failed ${e && e.message}`);
         return null;
       });
@@ -231,7 +247,7 @@ async function syncClassroom({ deep = false, quiet = false } = {}) {
 
       // Overdue work moves from Assigned to the Missing tab. Read that too.
       await load(win, `https://classroom.google.com/u/${account}/a/missing/all`);
-      const missing = await win.webContents.executeJavaScript(READ_TODO, true).catch(() => null);
+      const missing = await run(win, READ_TODO).catch(() => null);
       logLine(`missing: sections=${missing && missing.texts ? missing.texts.length : 0} links=${missing && missing.links ? missing.links.length : 0}`);
       if (missing && missing.signedIn && Array.isArray(missing.texts)) {
         for (const text of missing.texts.filter((t) => t.length >= 20)) {
@@ -248,7 +264,7 @@ async function syncClassroom({ deep = false, quiet = false } = {}) {
       // Every enrolled class, not just the ones with something on To-do.
       try {
         await load(win, `https://classroom.google.com/u/${account}/h`);
-        const list = await win.webContents.executeJavaScript(READ_CLASSES, true).catch(() => null);
+        const list = await run(win, READ_CLASSES).catch(() => null);
         if (list && list.classes && list.classes.length > 0) {
           const r = await postJson("/api/desktop/classes", { token, classes: list.classes });
           logLine(`classes: read ${list.classes.length}, added ${r.added}: ${list.classes.map((c) => c.name).join(" | ")}`);
@@ -263,7 +279,7 @@ async function syncClassroom({ deep = false, quiet = false } = {}) {
       const items = [];
       for (const link of todo.links.slice(0, deep ? MAX_DETAILS : 10)) {
         await load(win, link.href);
-        const detail = await win.webContents.executeJavaScript(READ_DETAIL, true).catch(() => null);
+        const detail = await run(win, READ_DETAIL).catch(() => null);
         if (!detail) continue;
         const docs = [];
         for (const [id, name] of Object.entries(detail.docs || {}).slice(0, 3)) {
@@ -348,6 +364,8 @@ ipcMain.handle("koptic:sync", (_e, opts) => syncClassroom({ deep: Boolean(opts &
 app.on("second-instance", () => showKoptic(null));
 
 app.whenReady().then(() => {
+  logLine("Koptic Desktop started (sync log version 2)");
+  flushLog();
   if (process.platform === "win32") app.setAppUserModelId("app.koptic.desktop");
   tray = new Tray(path.join(__dirname, "icon.png"));
   tray.on("click", () => showKoptic(null));
