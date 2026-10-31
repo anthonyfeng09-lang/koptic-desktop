@@ -13,6 +13,7 @@
  */
 const { app, BrowserWindow, Menu, Notification, Tray, ipcMain, safeStorage, session, shell } = require("electron");
 const fs = require("node:fs");
+const { execFile } = require("node:child_process");
 const path = require("node:path");
 const { READ_TODO, READ_DETAIL, READ_CLASSES } = require("./classroom-scripts");
 
@@ -174,7 +175,7 @@ async function postJson(route, body) {
 }
 
 /** Text of a Google Doc the school account can open, or "" if it can't. */
-async function docText(id, account) {
+async function docText(id, account, max = 12000) {
   try {
     const ses = session.fromPartition("persist:classroom");
     const res = await ses.fetch(
@@ -182,7 +183,7 @@ async function docText(id, account) {
     );
     const type = res.headers.get("content-type") || "";
     if (!res.ok || !type.startsWith("text/plain")) return "";
-    return (await res.text()).slice(0, 12000);
+    return (await res.text()).slice(0, max);
   } catch {
     return "";
   }
@@ -361,11 +362,59 @@ ipcMain.handle("koptic:pair", (_e, token) => {
 });
 ipcMain.handle("koptic:sync", (_e, opts) => syncClassroom({ deep: Boolean(opts && opts.deep) }));
 ipcMain.handle("koptic:classroom-signin", () => signInToClassroom());
+ipcMain.handle("koptic:read-gdoc", async (_e, docId) => {
+  if (typeof docId !== "string" || !/^[A-Za-z0-9_-]{20,100}$/.test(docId)) return { error: "That isn't a Google Doc link." };
+  // Every account signed in to the Classroom window, until one can open it.
+  for (let account = 0; account < MAX_ACCOUNTS; account++) {
+    const text = await docText(docId, account, 60000);
+    if (text.trim()) return { text };
+  }
+  return { error: "None of the accounts signed in to Classroom here can open that doc." };
+});
+
+// ---------------- learning your routine ----------------
+// Every couple of minutes, the names of the programs running go to Koptic,
+// which keeps only the ones that mean an activity (a game, an editor, one of
+// your activity apps) as "Valorant, 8:02 to 9:40". Nothing else is kept.
+// Turn it off in Settings, Learn my routine.
+
+const WATCH_EVERY_MS = 2 * 60 * 1000;
+let watchPausedUntil = 0;
+
+function runningPrograms() {
+  return new Promise((resolve) => {
+    const done = (err, out) =>
+      resolve(err ? [] : [...new Set(String(out).split(/\r?\n/).map((l) => l.trim()).filter(Boolean))]);
+    if (process.platform === "win32") {
+      execFile("tasklist", ["/fo", "csv", "/nh"], { windowsHide: true, maxBuffer: 8e6 }, (err, out) =>
+        done(err, String(out || "").split(/\r?\n/).map((l) => (l.match(/^"([^"]+)"/) || [])[1] || "").join("\n")),
+      );
+    } else {
+      execFile("ps", ["-axo", "comm="], { maxBuffer: 8e6 }, (err, out) =>
+        done(err, String(out || "").split("\n").map((l) => path.basename(l.trim())).join("\n")),
+      );
+    }
+  });
+}
+
+async function watchActivities() {
+  const token = readToken();
+  if (!token || Date.now() < watchPausedUntil) return;
+  const running = await runningPrograms();
+  if (running.length === 0) return;
+  try {
+    const r = await postJson("/api/desktop/activity", { token, running });
+    // Learn my routine is off: check again in a few hours in case it's back on.
+    if (r && r.off) watchPausedUntil = Date.now() + 6 * 60 * 60 * 1000;
+  } catch {
+    // Offline or Koptic busy: the next check catches up.
+  }
+}
 
 app.on("second-instance", () => showKoptic(null));
 
 app.whenReady().then(() => {
-  logLine("Koptic Desktop started (sync log version 2)");
+  logLine("Koptic Desktop started (sync log version 3)");
   flushLog();
   if (process.platform === "win32") app.setAppUserModelId("app.koptic.desktop");
   tray = new Tray(path.join(__dirname, "icon.png"));
@@ -375,6 +424,8 @@ app.whenReady().then(() => {
   if (!process.argv.includes("--hidden")) showKoptic(readToken() ? "/today" : "/connect/classroom");
   setTimeout(() => syncClassroom({ quiet: true }), 30_000);
   setInterval(() => syncClassroom({ quiet: true }), SYNC_EVERY_MS);
+  setTimeout(watchActivities, 60_000);
+  setInterval(watchActivities, WATCH_EVERY_MS);
 });
 
 // Keep running in the tray when every window is closed.

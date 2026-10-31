@@ -15,14 +15,26 @@ function reply(data) {
 
 window.addEventListener("message", async (event) => {
   if (event.source !== window || event.origin !== KOPTIC_ORIGIN) return;
-  if (!location.pathname.startsWith("/connect/")) return;
   const msg = event.data;
   if (!msg || msg.source !== "koptic-page" || typeof msg.type !== "string") return;
+  const id = typeof msg.id === "string" ? msg.id.slice(0, 40) : undefined;
 
+  // Any Koptic page can ask whether it's in the desktop app.
   if (msg.type === "ping") {
-    reply({ type: "pong", paired: await ipcRenderer.invoke("koptic:paired") });
+    reply({ type: "pong", id, paired: await ipcRenderer.invoke("koptic:paired") });
     return;
   }
+  // Check My Draft reads the student's own Google Doc through the school
+  // account signed in here, so private docs work. Read only.
+  if (msg.type === "read-gdoc" && location.pathname.startsWith("/assignments/")) {
+    const docId = typeof msg.docId === "string" ? msg.docId : "";
+    const result = await ipcRenderer.invoke("koptic:read-gdoc", docId);
+    reply({ type: "gdoc-text", id, ...result });
+    return;
+  }
+
+  // Pairing and syncing stay on the Connect pages.
+  if (!location.pathname.startsWith("/connect/")) return;
   if (msg.type === "pair") {
     const token = typeof msg.token === "string" ? msg.token.trim() : "";
     const ok = await ipcRenderer.invoke("koptic:pair", token);
