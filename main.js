@@ -360,6 +360,7 @@ ipcMain.handle("koptic:pair", (_e, token) => {
   return true;
 });
 ipcMain.handle("koptic:sync", (_e, opts) => syncClassroom({ deep: Boolean(opts && opts.deep) }));
+ipcMain.handle("koptic:classroom-signin", () => signInToClassroom());
 
 app.on("second-instance", () => showKoptic(null));
 

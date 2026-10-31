@@ -29,6 +29,10 @@ window.addEventListener("message", async (event) => {
     reply({ type: "pair-result", ok });
     return;
   }
+  if (msg.type === "classroom-signin") {
+    ipcRenderer.invoke("koptic:classroom-signin");
+    return;
+  }
   if (msg.type === "first-sync") {
     ipcRenderer.invoke("koptic:sync", { deep: true });
     reply({ type: "first-sync-started" });
