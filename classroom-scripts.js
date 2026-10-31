@@ -13,7 +13,7 @@ exports.READ_TODO = `(async () => {
 
   const main = document.querySelector("[role=main]") || document.body;
   const text = () => (main.innerText || "").replace(/\\r\\n?/g, "\\n").trim();
-  const SECTION = /(no due date|this week|next week|later|earlier)/i;
+  const SECTION = /(no due date|this week|next week|last week|later|earlier)/i;
   for (let i = 0; i < 16 && !SECTION.test(text()); i++) await sleep(500);
 
   const links = new Map();
@@ -59,3 +59,23 @@ exports.READ_DETAIL = `(async () => {
   }
   return { text: (main().innerText || "").slice(0, 60000), docs };
 })()`;
+
+/** Classroom's home page: every class the student is enrolled in, by name.
+ *  Reads the class cards and the sidebar; only links straight to a class. */
+exports.READ_CLASSES = `(async () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  if (location.hostname !== "classroom.google.com") return { signedIn: false, classes: [] };
+  for (let i = 0; i < 20 && !document.querySelector('a[href*="/c/"]'); i++) await sleep(500);
+  await sleep(800);
+  const byId = new Map();
+  for (const a of document.querySelectorAll('a[href*="/c/"]')) {
+    const m = (a.getAttribute("href") || "").match(/\\/c\\/([A-Za-z0-9_-]+)\\/?(?:[?#]|$)/);
+    if (!m) continue;
+    const first = (a.innerText || a.getAttribute("aria-label") || "")
+      .split("\\n").map((s) => s.trim()).find((s) => s.length > 1);
+    if (!first) continue;
+    if (!byId.has(m[1]) || first.length > byId.get(m[1]).length) byId.set(m[1], first);
+  }
+  return { signedIn: true, classes: Array.from(byId.values()).map((name) => ({ name })) };
+})()`;
+

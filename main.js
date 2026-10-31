@@ -14,7 +14,7 @@
 const { app, BrowserWindow, Menu, Notification, Tray, ipcMain, safeStorage, session, shell } = require("electron");
 const fs = require("node:fs");
 const path = require("node:path");
-const { READ_TODO, READ_DETAIL } = require("./classroom-scripts");
+const { READ_TODO, READ_DETAIL, READ_CLASSES } = require("./classroom-scripts");
 
 const KOPTIC = "https://koptic.vercel.app";
 const SYNC_EVERY_MS = 2 * 60 * 60 * 1000;
@@ -32,6 +32,17 @@ let lastSync = null;
 // ---------------- settings and the token ----------------
 
 const dataFile = (name) => path.join(app.getPath("userData"), name);
+
+/** What the last sync saw, next to the app, so a sync that brings in nothing
+ *  can be explained. Overwritten each sync; only titles and counts. */
+const SYNC_LOG = path.join(__dirname, "last-sync.txt");
+let syncLog = [];
+const logLine = (line) => syncLog.push(`${new Date().toISOString()} ${line}`);
+const flushLog = () => {
+  try {
+    fs.writeFileSync(SYNC_LOG, syncLog.join("\n") + "\n");
+  } catch {}
+};
 
 function readSettings() {
   try {
@@ -177,6 +188,8 @@ async function syncClassroom({ deep = false, quiet = false } = {}) {
     return;
   }
   syncing = true;
+  syncLog = [];
+  logLine(`sync start deep=${deep} quiet=${quiet}`);
   updateTray();
   const win = getClassroomWindow(false);
   const settings = readSettings();
@@ -190,7 +203,13 @@ async function syncClassroom({ deep = false, quiet = false } = {}) {
   try {
     for (const account of order) {
       await load(win, `https://classroom.google.com/u/${account}/a/not-turned-in/all`);
-      const todo = await win.webContents.executeJavaScript(READ_TODO, true).catch(() => null);
+      const todo = await win.webContents.executeJavaScript(READ_TODO, true).catch((e) => {
+        logLine(`account ${account}: read failed ${e && e.message}`);
+        return null;
+      });
+      logLine(
+        `account ${account}: url=${win.webContents.getURL()} signedIn=${todo && todo.signedIn} hasClasses=${todo && todo.hasClasses} sections=${todo && todo.texts ? todo.texts.length : 0} links=${todo && todo.links ? todo.links.length : 0}`,
+      );
       if (!todo || !todo.signedIn) {
         if (account === order[0] && !found) {
           if (!quiet) signInToClassroom();
@@ -205,6 +224,39 @@ async function syncClassroom({ deep = false, quiet = false } = {}) {
       for (const text of todo.texts.filter((t) => t.length >= 20)) {
         const r = await postJson("/api/extension/import", { token, text });
         added += Number(r.added) || 0;
+        logLine(`posted ${text.length} chars -> ${JSON.stringify(r).slice(0, 300)}`);
+        logLine(`  text starts: ${text.slice(0, 400).replace(/\s+/g, " ")}`);
+      }
+      for (const l of todo.links) logLine(`  link: ${l.title} | ${l.course}`);
+
+      // Overdue work moves from Assigned to the Missing tab. Read that too.
+      await load(win, `https://classroom.google.com/u/${account}/a/missing/all`);
+      const missing = await win.webContents.executeJavaScript(READ_TODO, true).catch(() => null);
+      logLine(`missing: sections=${missing && missing.texts ? missing.texts.length : 0} links=${missing && missing.links ? missing.links.length : 0}`);
+      if (missing && missing.signedIn && Array.isArray(missing.texts)) {
+        for (const text of missing.texts.filter((t) => t.length >= 20)) {
+          const r = await postJson("/api/extension/import", { token, text });
+          added += Number(r.added) || 0;
+          logLine(`posted missing ${text.length} chars -> ${JSON.stringify(r).slice(0, 300)}`);
+          logLine(`  text starts: ${text.slice(0, 400).replace(/\s+/g, " ")}`);
+        }
+        for (const l of missing.links || []) {
+          if (!todo.links.some((t) => t.href === l.href)) todo.links.push(l);
+        }
+      }
+
+      // Every enrolled class, not just the ones with something on To-do.
+      try {
+        await load(win, `https://classroom.google.com/u/${account}/h`);
+        const list = await win.webContents.executeJavaScript(READ_CLASSES, true).catch(() => null);
+        if (list && list.classes && list.classes.length > 0) {
+          const r = await postJson("/api/desktop/classes", { token, classes: list.classes });
+          logLine(`classes: read ${list.classes.length}, added ${r.added}: ${list.classes.map((c) => c.name).join(" | ")}`);
+        } else {
+          logLine("classes: none read");
+        }
+      } catch (err) {
+        logLine(`classes failed: ${err && err.message ? err.message : err}`);
       }
 
       // Instructions and attached Docs, for each assignment on the list.
@@ -236,8 +288,11 @@ async function syncClassroom({ deep = false, quiet = false } = {}) {
       );
     }
   } catch (err) {
+    logLine(`error: ${err && err.message ? err.message : err}`);
     if (!quiet) notify("Couldn't sync", String(err && err.message ? err.message : err));
   } finally {
+    logLine(`done added=${added} filled=${filled} found=${found}`);
+    flushLog();
     syncing = false;
     updateTray();
   }
