@@ -7,7 +7,7 @@
 const { ipcRenderer } = require("electron");
 
 const KOPTIC_ORIGIN = "https://koptic.vercel.app";
-const VERSION = "desktop-0.2.3";
+const VERSION = "desktop-0.2.4";
 
 function reply(data) {
   window.postMessage({ source: "koptic-extension", version: VERSION, ...data }, KOPTIC_ORIGIN);
@@ -33,7 +33,16 @@ window.addEventListener("message", async (event) => {
     return;
   }
 
-  // Pairing and syncing stay on the Connect pages.
+  // Sync Now from any Koptic page: say it started, then report what came in.
+  // Read only, like every sync.
+  if (msg.type === "sync") {
+    reply({ type: "sync-started", id });
+    const result = await ipcRenderer.invoke("koptic:sync", { deep: true }).catch(() => null);
+    reply({ type: "sync-done", id, ...(result && typeof result === "object" ? result : {}) });
+    return;
+  }
+
+  // Pairing and the first sync stay on the Connect pages.
   if (!location.pathname.startsWith("/connect/")) return;
   if (msg.type === "pair") {
     const token = typeof msg.token === "string" ? msg.token.trim() : "";

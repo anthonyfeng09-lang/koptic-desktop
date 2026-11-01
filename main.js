@@ -197,14 +197,14 @@ let syncStartedAt = 0;
 
 async function syncClassroom({ deep = false, quiet = false } = {}) {
   // A sync that somehow never finished must not block every later one.
-  if (syncing && Date.now() - syncStartedAt < 10 * 60 * 1000) return;
+  if (syncing && Date.now() - syncStartedAt < 10 * 60 * 1000) return { busy: true };
   const token = readToken();
   if (!token) {
     if (!quiet) {
       notify("Connect Koptic first", "Opening Connect Classroom. Sign in to Koptic there.");
       showKoptic("/connect/classroom");
     }
-    return;
+    return { notConnected: true };
   }
   syncing = true;
   syncStartedAt = Date.now();
@@ -346,6 +346,7 @@ async function syncClassroom({ deep = false, quiet = false } = {}) {
     syncing = false;
     updateTray();
   }
+  return { added, turnedIn, filled, found };
 }
 
 // ---------------- tray ----------------
