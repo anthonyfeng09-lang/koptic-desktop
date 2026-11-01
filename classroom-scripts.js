@@ -71,10 +71,19 @@ exports.READ_CLASSES = `(async () => {
   for (const a of document.querySelectorAll('a[href*="/c/"]')) {
     const m = (a.getAttribute("href") || "").match(/\\/c\\/([A-Za-z0-9_-]+)\\/?(?:[?#]|$)/);
     if (!m) continue;
-    const first = (a.innerText || a.getAttribute("aria-label") || "")
-      .split("\\n").map((s) => s.trim()).find((s) => s.length > 1);
-    if (!first) continue;
-    if (!byId.has(m[1]) || first.length > byId.get(m[1]).length) byId.set(m[1], first);
+    // Read the link's text pieces one by one. innerText glues the avatar
+    // letter, the name and the section together ("MMaple Athletics",
+    // "MPM2DZ_2627_S1Period 1"); the name is the first piece longer than
+    // one letter.
+    const parts = [];
+    const walk = document.createTreeWalker(a, NodeFilter.SHOW_TEXT);
+    while (walk.nextNode()) {
+      const t = (walk.currentNode.textContent || "").replace(/\\s+/g, " ").trim();
+      if (t) parts.push(t);
+    }
+    const first = parts.find((s) => s.length > 1) || (a.getAttribute("aria-label") || "").trim();
+    if (!first || first.length < 2) continue;
+    if (!byId.has(m[1])) byId.set(m[1], first);
   }
   return { signedIn: true, classes: Array.from(byId.values()).map((name) => ({ name })) };
 })()`;
