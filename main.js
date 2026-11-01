@@ -19,7 +19,7 @@ const { app, BrowserWindow, Menu, Notification, Tray, ipcMain, safeStorage, sess
 const fs = require("node:fs");
 const { execFile } = require("node:child_process");
 const path = require("node:path");
-const { READ_TODO, READ_DETAIL, READ_CLASSES } = require("./classroom-scripts");
+const { READ_TODO, READ_DETAIL, READ_CLASSES, READ_WORK } = require("./classroom-scripts");
 
 const KOPTIC = "https://koptic.vercel.app";
 const SYNC_EVERY_MS = 2 * 60 * 60 * 1000;
@@ -220,6 +220,7 @@ async function syncClassroom({ deep = false, quiet = false } = {}) {
 
   let added = 0;
   let filled = 0;
+  let turnedIn = 0;
   let found = false;
   try {
     for (const account of order) {
@@ -242,37 +243,16 @@ async function syncClassroom({ deep = false, quiet = false } = {}) {
       found = true;
       writeSettings({ classroomAccount: account });
 
-      for (const text of todo.texts.filter((t) => t.length >= 20)) {
-        const r = await postJson("/api/extension/import", { token, text });
-        added += Number(r.added) || 0;
-        logLine(`posted ${text.length} chars -> ${JSON.stringify(r).slice(0, 300)}`);
-        logLine(`  text starts: ${text.slice(0, 400).replace(/\s+/g, " ")}`);
-      }
-      for (const l of todo.links) logLine(`  link: ${l.title} | ${l.course}`);
-
-      // Overdue work moves from Assigned to the Missing tab. Read that too.
-      await load(win, `https://classroom.google.com/u/${account}/a/missing/all`);
-      const missing = await run(win, READ_TODO).catch(() => null);
-      logLine(`missing: sections=${missing && missing.texts ? missing.texts.length : 0} links=${missing && missing.links ? missing.links.length : 0}`);
-      if (missing && missing.signedIn && Array.isArray(missing.texts)) {
-        for (const text of missing.texts.filter((t) => t.length >= 20)) {
-          const r = await postJson("/api/extension/import", { token, text });
-          added += Number(r.added) || 0;
-          logLine(`posted missing ${text.length} chars -> ${JSON.stringify(r).slice(0, 300)}`);
-          logLine(`  text starts: ${text.slice(0, 400).replace(/\s+/g, " ")}`);
-        }
-        for (const l of missing.links || []) {
-          if (!todo.links.some((t) => t.href === l.href)) todo.links.push(l);
-        }
-      }
-
-      // Every enrolled class, not just the ones with something on To-do.
+      // Every class, then each class's "Your work" page: every assignment,
+      // its due date and whether it's handed in.
+      let classes = [];
       try {
         await load(win, `https://classroom.google.com/u/${account}/h`);
         const list = await run(win, READ_CLASSES).catch(() => null);
         if (list && list.classes && list.classes.length > 0) {
-          const r = await postJson("/api/desktop/classes", { token, classes: list.classes });
-          logLine(`classes: read ${list.classes.length}, added ${r.added}: ${list.classes.map((c) => c.name).join(" | ")}`);
+          classes = list.classes;
+          const r = await postJson("/api/desktop/classes", { token, classes });
+          logLine(`classes: read ${classes.length}, added ${r.added}: ${classes.map((c) => c.name).join(" | ")}`);
         } else {
           logLine("classes: none read");
         }
@@ -280,9 +260,54 @@ async function syncClassroom({ deep = false, quiet = false } = {}) {
         logLine(`classes failed: ${err && err.message ? err.message : err}`);
       }
 
-      // Instructions and attached Docs, for each assignment on the list.
+      const needDetails = [];
+      let workRead = 0;
+      for (const c of classes.filter((x) => x.workHref)) {
+        await load(win, `https://classroom.google.com${c.workHref}`);
+        const work = await run(win, READ_WORK, 60000).catch(() => null);
+        if (!work || !work.signedIn) continue;
+        workRead += 1;
+        if (!Array.isArray(work.items) || work.items.length === 0) continue;
+        try {
+          const r = await postJson("/api/desktop/work", { token, courseName: c.name, items: work.items });
+          added += Number(r.added) || 0;
+          turnedIn += Number(r.statusChanged) || 0;
+          for (const d of r.needDetails || []) needDetails.push({ ...d, classId: c.id, courseName: c.name });
+          logLine(`work ${c.name}: ${work.items.length} items -> ${JSON.stringify(r).slice(0, 200)}`);
+        } catch (err) {
+          logLine(`work ${c.name} failed: ${err && err.message ? err.message : err}`);
+        }
+      }
+
+      // The To-do pages are the fallback when no "Your work" page could be read.
+      if (workRead === 0) {
+        for (const text of todo.texts.filter((t) => t.length >= 20)) {
+          const r = await postJson("/api/extension/import", { token, text });
+          added += Number(r.added) || 0;
+          logLine(`posted ${text.length} chars -> ${JSON.stringify(r).slice(0, 300)}`);
+        }
+        await load(win, `https://classroom.google.com/u/${account}/a/missing/all`);
+        const missing = await run(win, READ_TODO).catch(() => null);
+        if (missing && missing.signedIn && Array.isArray(missing.texts)) {
+          for (const text of missing.texts.filter((t) => t.length >= 20)) {
+            const r = await postJson("/api/extension/import", { token, text });
+            added += Number(r.added) || 0;
+          }
+          for (const l of missing.links || []) {
+            if (!todo.links.some((t) => t.href === l.href)) todo.links.push(l);
+          }
+        }
+      }
+
+      // Instructions and attached Docs for open work that has none yet.
+      const links = needDetails.map((d) => ({
+        href: `https://classroom.google.com/u/${account}/c/${d.classId}/a/${Buffer.from(String(d.id)).toString("base64").replace(/=+$/, "")}/details`,
+        title: d.title,
+        course: d.courseName,
+      }));
+      if (workRead === 0) links.push(...todo.links);
       const items = [];
-      for (const link of todo.links.slice(0, deep ? MAX_DETAILS : 10)) {
+      for (const link of links.slice(0, deep ? MAX_DETAILS : 12)) {
         await load(win, link.href);
         const detail = await run(win, READ_DETAIL).catch(() => null);
         if (!detail) continue;
@@ -302,17 +327,21 @@ async function syncClassroom({ deep = false, quiet = false } = {}) {
 
     lastSync = new Date();
     if (!found && !quiet) notify("No classes found", "Sign in to Classroom with your school account, then press Sync now.");
-    else if (added > 0 || filled > 0 || !quiet) {
+    else if (added > 0 || filled > 0 || turnedIn > 0 || !quiet) {
       notify(
         "Koptic is up to date",
-        added > 0 ? `${added} new from Classroom.` : filled > 0 ? `Instructions added to ${filled}.` : "Nothing new in Classroom.",
+        [
+          added > 0 ? `${added} new from Classroom.` : "",
+          turnedIn > 0 ? `${turnedIn} marked turned in.` : "",
+          filled > 0 ? `Instructions added to ${filled}.` : "",
+        ].filter(Boolean).join(" ") || "Nothing new in Classroom.",
       );
     }
   } catch (err) {
     logLine(`error: ${err && err.message ? err.message : err}`);
     if (!quiet) notify("Couldn't sync", String(err && err.message ? err.message : err));
   } finally {
-    logLine(`done added=${added} filled=${filled} found=${found}`);
+    logLine(`done added=${added} turnedIn=${turnedIn} filled=${filled} found=${found}`);
     flushLog();
     syncing = false;
     updateTray();
