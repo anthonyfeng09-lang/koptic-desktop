@@ -1,5 +1,9 @@
 /**
- * Koptic Desktop (stage 1).
+ * Koptic Desktop, for Windows, Mac and Linux.
+ *
+ * Installed from the one-file installers GitHub builds (see
+ * .github/workflows/release.yml), or run from this folder with install.cmd /
+ * install.sh. Updates itself when installed (electron-updater).
  *
  * - The Koptic window: koptic.vercel.app in its own window and tray icon.
  * - Its own Classroom window: you sign in once with your school account, and
@@ -36,7 +40,7 @@ const dataFile = (name) => path.join(app.getPath("userData"), name);
 
 /** What the last sync saw, next to the app, so a sync that brings in nothing
  *  can be explained. Overwritten each sync; only titles and counts. */
-const SYNC_LOG = path.join(__dirname, "last-sync.txt");
+const SYNC_LOG = path.join(app.getPath("userData"), "last-sync.txt");
 let syncLog = [];
 const logLine = (line) => syncLog.push(`${new Date().toISOString()} ${line}`);
 const flushLog = () => {
@@ -332,11 +336,11 @@ function updateTray() {
         enabled: false,
       },
       {
-        label: "Start with Windows",
+        label: process.platform === "darwin" ? "Open at Login" : process.platform === "win32" ? "Start with Windows" : "Start When I Log In",
         type: "checkbox",
         checked: startAtLogin,
         click: (item) => {
-          app.setLoginItemSettings({ openAtLogin: item.checked, args: ["--hidden"] });
+          app.setLoginItemSettings({ openAtLogin: item.checked, openAsHidden: true, args: ["--hidden"] });
           updateTray();
         },
       },
@@ -413,20 +417,56 @@ async function watchActivities() {
 
 app.on("second-instance", () => showKoptic(null));
 
+// ---------------- updates ----------------
+// Installed copies check GitHub for a newer version, download it in the
+// background and install it the next time Koptic restarts. Running from the
+// folder (install.cmd / install.sh) skips this; git pull is the update there.
+function checkForUpdates() {
+  if (!app.isPackaged) return;
+  try {
+    const { autoUpdater } = require("electron-updater");
+    autoUpdater.autoInstallOnAppQuit = true;
+    autoUpdater.on("update-downloaded", (info) => {
+      notify("Koptic update ready", `Version ${info.version} installs next time Koptic restarts.`);
+    });
+    autoUpdater.on("error", (err) => logLine(`update error: ${err && err.message ? err.message : err}`));
+    autoUpdater.checkForUpdates().catch(() => {});
+  } catch {
+    // Not installed with the updater (running from source): nothing to do.
+  }
+}
+
+/** The tray picture: small enough for the Mac menu bar and Linux panels. */
+function trayIcon() {
+  const { nativeImage } = require("electron");
+  const file = process.platform === "win32" ? "icon.png" : "tray.png";
+  let img = nativeImage.createFromPath(path.join(__dirname, file));
+  if (process.platform === "darwin") img = img.resize({ width: 18, height: 18 });
+  return img;
+}
+
 app.whenReady().then(() => {
-  logLine("Koptic Desktop started (sync log version 3)");
+  logLine("Koptic Desktop started (sync log version 4)");
   flushLog();
   if (process.platform === "win32") app.setAppUserModelId("app.koptic.desktop");
-  tray = new Tray(path.join(__dirname, "icon.png"));
+  tray = new Tray(trayIcon());
   tray.on("click", () => showKoptic(null));
   updateTray();
 
-  if (!process.argv.includes("--hidden")) showKoptic(readToken() ? "/today" : "/connect/classroom");
+  const startedHidden =
+    process.argv.includes("--hidden") ||
+    (process.platform === "darwin" && app.getLoginItemSettings().wasOpenedAsHidden);
+  if (!startedHidden) showKoptic(readToken() ? "/today" : "/connect/classroom");
   setTimeout(() => syncClassroom({ quiet: true }), 30_000);
   setInterval(() => syncClassroom({ quiet: true }), SYNC_EVERY_MS);
   setTimeout(watchActivities, 60_000);
   setInterval(watchActivities, WATCH_EVERY_MS);
+  setTimeout(checkForUpdates, 15_000);
+  setInterval(checkForUpdates, 6 * 60 * 60 * 1000);
 });
+
+// On a Mac, clicking the Dock icon with no window open brings Koptic back.
+app.on("activate", () => showKoptic(null));
 
 // Keep running in the tray when every window is closed.
 app.on("window-all-closed", () => {});

@@ -1,0 +1,69 @@
+# Builds Koptic Desktop for Windows, Mac and Linux and publishes it as a
+# GitHub release, every time the version in package.json goes up.
+#
+# This file lives in Koptic's desktop/ folder and runs in the public
+# koptic-desktop repo, which is that folder on its own:
+#   git subtree push --prefix desktop desktop main
+# Public repos get free Mac and Windows build machines, and the download
+# links (releases/latest/download/...) work for anyone.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      build: ${{ steps.v.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          DRAFT=$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null || echo "none")
+          if [ "$DRAFT" = "false" ]; then
+            echo "v$VERSION is already out. Bump the version in package.json to release again."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            if [ "$DRAFT" = "none" ]; then
+              gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" \
+                --title "Koptic $VERSION" --notes "Koptic Desktop $VERSION for Windows, Mac and Linux."
+            fi
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: npx electron-builder --publish always
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "v${{ needs.prepare.outputs.version }}" --repo "$GITHUB_REPOSITORY" --draft=false --latest

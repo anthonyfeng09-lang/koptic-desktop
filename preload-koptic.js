@@ -7,7 +7,7 @@
 const { ipcRenderer } = require("electron");
 
 const KOPTIC_ORIGIN = "https://koptic.vercel.app";
-const VERSION = "desktop-0.1.0";
+const VERSION = "desktop-0.2.0";
 
 function reply(data) {
   window.postMessage({ source: "koptic-extension", version: VERSION, ...data }, KOPTIC_ORIGIN);

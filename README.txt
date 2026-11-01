@@ -1,19 +1,27 @@
-Koptic Desktop (Windows), stage 1
+Koptic Desktop (Windows, Mac and Linux)
 
 What it does
-- Opens Koptic in its own window, with a tray icon by the clock.
+- Opens Koptic in its own window, with a tray or menu bar icon.
 - Has its own Classroom window. Sign in once with your school account.
-- Reads your Classroom To-do, opens each assignment for its instructions,
-  and reads any Google Docs attached. Sends it all to Koptic.
+- Reads your Classroom To-do and Missing work, opens each assignment for its
+  instructions, and reads attached Google Docs. Sends it all to Koptic.
 - Syncs when it starts, every 2 hours, and when you pick Sync Classroom Now.
+- Learns when you usually game or edit (Settings, Your Routine; can be off).
 - Read only. It never turns in, edits or posts anything in Classroom.
 
-Set up
-1. Double-click install.cmd (needs Node.js; it tells you if it's missing).
-2. Koptic opens on Connect Classroom. Sign in to Koptic. It pairs by itself.
-3. Tray icon > Sign In to Classroom. Use your school account. Close that
-   window when you see your classes.
-4. Tray icon > Sync Classroom Now.
+Install (easy way)
+  Download the installer for your computer at https://koptic.vercel.app/download
+  It updates itself after that.
 
-Tray menu: Open Koptic, Sync Classroom Now, Sign In to Classroom,
-Start with Windows, Quit Koptic.
+Install (script way, from this folder)
+  Windows:      double-click install.cmd
+  Mac / Linux:  open Terminal in this folder and run:  sh install.sh
+  Both need Node.js; the scripts install it or tell you where to get it.
+
+Then
+1. Koptic opens on Connect Classroom. Sign in to Koptic. It pairs by itself.
+2. Press Sign In to Classroom. Use your school account.
+3. Pick which classes are real classes, clubs or ones to ignore.
+
+Tray / menu bar: Open Koptic, Sync Classroom Now, Sign In to Classroom,
+start at login, Quit Koptic.
