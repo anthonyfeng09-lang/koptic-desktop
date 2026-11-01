@@ -1,7 +1,7 @@
 {
   "name": "koptic-desktop",
   "productName": "Koptic",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Koptic for your computer: your school work, read straight from Classroom.",
   "author": "Koptic",
@@ -52,7 +52,8 @@
           ]
         }
       ],
-      "artifactName": "Koptic-Setup.${ext}"
+      "artifactName": "Koptic-Setup.${ext}",
+      "icon": "build/icon.png"
     },
     "nsis": {
       "oneClick": true,
